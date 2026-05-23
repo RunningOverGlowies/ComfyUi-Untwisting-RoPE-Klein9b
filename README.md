@@ -2,6 +2,9 @@
 
 100% vibe-coded, appears to work. If you get too much structure bleeding in from reference increase `start_block`. Other very effectual parameters seem to be `gamma` on the RF node and `adain_strength` on the RoPE node.
 
+<img width="2458" height="1385" alt="Klein 9b Example" src="https://github.com/user-attachments/assets/9da4174c-233f-4349-bd9b-f9a38d160c5d" />
+
+
 # ComfyUi-Untwisting-RoPE (Training-Free Style Tranfer)
 
 This is a ComfyUi implementation of [Untwisting RoPE: Frequency Control for Shared Attention in DiTs](https://arxiv.org/abs/2602.05013)
