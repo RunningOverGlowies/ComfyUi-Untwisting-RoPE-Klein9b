@@ -3,21 +3,24 @@ import math
 import types
 import hashlib
 import time
+import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import comfy.utils
 import comfy.patcher_extension
+
 try:
     import latent_preview
 except Exception:
     latent_preview = None
+
+import comfy.ldm.flux.math
+import comfy.ldm.flux.layers
 from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import optimized_attention
 
-_PREFIX = '[UntwistingRoPE]'
+_PREFIX = '[UntwistingRoPE-Klein9b]'
 
-# Module-level fallback store. Comfy/KSampler may clone or pass model objects
-# through different instances, so the export node reads this if the model-local
 _RF_LAST_DEBUG_STORE: Dict[str, Any] = {
     'cache': {},
     'sampler_sigmas': None,
@@ -25,14 +28,159 @@ _RF_LAST_DEBUG_STORE: Dict[str, Any] = {
     'run_count': 0,
 }
 
-# Persistent RF trajectory cache shared across prompt executions.
-# Keyed by reference latent, reference conditioning, sigma schedule, RF mode,
-# and RF parameters. Values are stored on CPU to avoid pinning VRAM.
 _RF_PERSISTENT_TRAJECTORY_CACHE: Dict[str, Dict[str, Any]] = {}
 _RF_PERSISTENT_CACHE_MAX_ITEMS = 4
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Persistent RF cache helpers
+# Native Attention Interceptor (Double-bound to math and layers namespaces)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _lerp(a: float, b: float, t: float) -> float:
+    return float(a + (b - a) * t)
+
+def _adain(target: torch.Tensor, style: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    t_mean = target.mean(dim=2, keepdim=True)
+    s_mean = style.mean(dim=2, keepdim=True)
+    t_std  = target.float().var(dim=2, keepdim=True, unbiased=False).add(eps).sqrt().to(target.dtype)
+    s_std  = style.float().var(dim=2, keepdim=True, unbiased=False).add(eps).sqrt().to(target.dtype)
+    return (target - t_mean) / t_std * s_std + s_mean
+
+def _cross_batch_adain_qk_generic(
+    xq: torch.Tensor, xk: torch.Tensor, 
+    xq_r: torch.Tensor, xk_r: torch.Tensor, 
+    s: int, e: int, strength: float, eps: float = 1e-6
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    a = max(0.0, min(1.0, strength))
+    if a <= 0.0 or e <= s:
+        return xq, xk
+    
+    q_t, k_t = xq[:, :, s:e], xk[:, :, s:e]
+    q_r, k_r = xq_r[:, :, s:e], xk_r[:, :, s:e]
+    
+    xq[:, :, s:e] = q_t * (1.0 - a) + _adain(q_t, q_r, eps) * a
+    xk[:, :, s:e] = k_t * (1.0 - a) + _adain(k_t, k_r, eps) * a
+    return xq, xk
+
+def untwisting_rope_attention_handler(
+    q: torch.Tensor, 
+    k: torch.Tensor, 
+    v: torch.Tensor, 
+    pe: Optional[torch.Tensor], 
+    mask: Optional[torch.Tensor] = None, 
+    transformer_options: Dict[str, Any] = {}
+) -> torch.Tensor:
+    cfg = transformer_options.get('untwisting_rope_zimage')
+    
+    if not cfg or not cfg.get('enabled'):
+        return _orig_flux_attention(q, k, v, pe, mask, transformer_options)
+        
+    block_idx = int(transformer_options.get('block_index', -1))
+    if not (int(cfg['start_block']) <= block_idx <= int(cfg['end_block'])):
+        return _orig_flux_attention(q, k, v, pe, mask, transformer_options)
+
+    # Apply RoPE calculations
+    if pe is not None:
+        q, k = apply_rope(q, k, pe)
+        pe = None
+
+    target_bsz = int(cfg.get('cross_batch_target_batch', 0))
+    bsz = q.shape[0]
+    heads = q.shape[1]
+    
+    img_slice = transformer_options.get("img_slice")
+    txt_len = img_slice[0] if img_slice else 0
+    seq_len = q.shape[2]
+
+    progress   = float(cfg.get('progress', 0.0))
+    high_scale = _lerp(cfg['high_scale_start'], cfg['high_scale_end'], progress)
+    low_scale  = _lerp(cfg['low_scale_start'],  cfg['low_scale_end'],  progress)
+    beta       = float(cfg.get('beta', 2.0))
+    head_dim   = q.shape[3]
+    
+    axes_dims = cfg.get('axes_dims', [16, 56, 56])
+    scale_vec = _build_frequency_scale_vector(
+        head_dim, axes_dims,
+        high_scale, low_scale, beta,
+        k.device, k.dtype,
+    ).view(1, 1, 1, head_dim)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Target-Only Standalone Patching Mode (If no RF Inversion is connected)
+    # ═══════════════════════════════════════════════════════════════════════════
+    if target_bsz <= 0 or bsz < target_bsz * 2:
+        # Scale the keys of the target frame directly
+        ref_k_img = k[:, :, txt_len:seq_len] * scale_vec
+        k_final = torch.cat([k[:, :, :txt_len], ref_k_img], dim=2)
+        return optimized_attention(q, k_final, v, heads, skip_reshape=True, mask=mask, transformer_options=transformer_options)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Reference-Guided Guidance Mode (With RF Inversion connected)
+    # ═══════════════════════════════════════════════════════════════════════════
+    q_t, k_t, v_t = q[:target_bsz], k[:target_bsz], v[:target_bsz]
+    q_r, k_r, v_r = q[target_bsz:target_bsz*2], k[target_bsz:target_bsz*2], v[target_bsz:target_bsz*2]
+
+    ref_k_img = k_r[:, :, txt_len:seq_len] * scale_vec
+    ref_v_img = v_r[:, :, txt_len:seq_len]
+
+    if cfg.get('apply_adain') and float(cfg.get('adain_strength', 0)) > 0:
+        q_t, k_t = _cross_batch_adain_qk_generic(
+            q_t, k_t, q_r, k_r,
+            txt_len, seq_len, float(cfg['adain_strength'])
+        )
+
+    k_t_final = torch.cat([k_t, ref_k_img], dim=2)
+    v_t_final = torch.cat([v_t, ref_v_img], dim=2)
+
+    mask_t = None
+    if mask is not None:
+        mask_t = mask[:target_bsz]
+        ref_len = ref_k_img.shape[2]
+        if mask_t.ndim >= 2:
+            padding = torch.zeros(
+                (*mask_t.shape[:-1], ref_len),
+                device=mask_t.device, dtype=mask_t.dtype,
+            )
+            mask_t = torch.cat([mask_t, padding], dim=-1)
+
+    out_t = optimized_attention(
+        q_t, k_t_final, v_t_final,
+        heads, skip_reshape=True, mask=mask_t,
+        transformer_options=transformer_options
+    )
+
+    mask_r = mask[target_bsz:target_bsz*2] if mask is not None and mask.shape[0] >= target_bsz * 2 else None
+    out_r = optimized_attention(
+        q_r, k_r, v_r,
+        heads, skip_reshape=True, mask=mask_r,
+        transformer_options=transformer_options
+    )
+
+    outs = [out_t, out_r]
+    
+    if bsz > target_bsz * 2:
+        q_extra, k_extra, v_extra = q[target_bsz*2:], k[target_bsz*2:], v[target_bsz*2:]
+        mask_extra = mask[target_bsz*2:] if mask is not None else None
+        out_extra = optimized_attention(
+            q_extra, k_extra, v_extra,
+            heads, skip_reshape=True, mask=mask_extra,
+            transformer_options=transformer_options
+        )
+        outs.append(out_extra)
+
+    return torch.cat(outs, dim=0)
+
+# Double-bind the monkey patch to math.py and layers.py namespaces
+if not hasattr(comfy.ldm.flux.math, "_untwist_orig_attention"):
+    comfy.ldm.flux.math._untwist_orig_attention = comfy.ldm.flux.math.attention
+    
+comfy.ldm.flux.math.attention = untwisting_rope_attention_handler
+comfy.ldm.flux.layers.attention = untwisting_rope_attention_handler
+
+_orig_flux_attention = comfy.ldm.flux.math._untwist_orig_attention
+print(f"{_PREFIX} Custom attention successfully double-bound to math.py and layers.py")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hashing and Cache helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _hash_update_tensor(h: "hashlib._Hash", t: torch.Tensor, full: bool = True) -> None:
@@ -87,22 +235,17 @@ def _make_rf_persistent_key(
     pmi_alpha: float = 0.4,
 ) -> str:
     h = hashlib.sha1()
-
     h.update(str(tuple(ref_clean.shape)).encode('utf-8'))
     _hash_update_tensor(h, ref_clean, full=True)
-
     h.update(_hash_any(ref_conditioning).encode('utf-8'))
-
     h.update(str([round(float(s), 8) for s in sampler_sigmas]).encode('utf-8'))
     h.update(str(int(target_b)).encode('utf-8'))
-
     h.update(str(rf_mode).encode('utf-8'))
     h.update(f'{float(gamma):.8f}'.encode('utf-8'))
     h.update(f'{float(gamma_curve):.8f}'.encode('utf-8'))
     h.update(f'{float(norm_strength):.8f}'.encode('utf-8'))
     h.update(str(cond_mode).encode('utf-8'))
     h.update(f'{float(pmi_alpha):.8f}'.encode('utf-8'))
-
     return h.hexdigest()
 
 def _cache_to_cpu(cache: Dict[float, torch.Tensor]) -> Dict[float, torch.Tensor]:
@@ -126,26 +269,22 @@ def _put_persistent_rf_cache(key: str, entry: Dict[str, Any]) -> None:
         _RF_PERSISTENT_TRAJECTORY_CACHE.pop(oldest, None)
 
 def _coerce_bool(value: Any) -> bool:
-    """Robust boolean parsing for ComfyUI values that may arrive as bools or strings."""
     if isinstance(value, str):
         return value.strip().lower() in ('1', 'true', 'yes', 'on', 'y', 't')
     return bool(value)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Runtime state
+# Runtime stats
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _RuntimeStats:
     def __init__(self, verbose: bool = False, rf_verbose: bool = False) -> None:
-        # verbose controls UntwistingRoPE patch/attention logs.
-        # rf_verbose controls RFInversion trajectory/wrapper logs.
         self.verbose: bool = _coerce_bool(verbose)
         self.rf_verbose: bool = _coerce_bool(rf_verbose)
         self.wrapper_calls:  int = 0
         self.patchify_calls: int = 0
         self.attn_calls:     int = 0
         self.context_refiner_calls: int = 0
-
         self.rf_sigma_cache: Dict[float, torch.Tensor] = {}
         self.rf_eps: Optional[torch.Tensor] = None
         self.rf_prev_z: Optional[torch.Tensor] = None
@@ -154,33 +293,20 @@ class _RuntimeStats:
         self.rf_run_count: int = 0
         self.rf_sampler_sigmas: Optional[List[float]] = None
         self.rf_schedule_built: bool = False
-
         self.fixed_noise: Optional[torch.Tensor] = None
-
         self.scale_vec_logged:  bool = False
         self.joint_mask_logged: bool = False
-
-        # Parameterization detection: tracks whether apply_model is x0 or velocity
         self.parameterization: str = 'unknown'
-        
 
 def _vprint(stats: Optional[_RuntimeStats], *args, **kwargs) -> None:
     if stats is not None and _coerce_bool(getattr(stats, 'verbose', False)):
         print(*args, **kwargs)
 
-
 def _rf_vprint(stats: Optional[_RuntimeStats], *args, **kwargs) -> None:
     if stats is not None and _coerce_bool(getattr(stats, 'rf_verbose', False)):
         print(*args, **kwargs)
 
-
 def _rf_step_iterator(num_steps: int):
-    """Plain RF step iterator.
-
-    Do not use tqdm/model_trange here because that refreshes a single terminal
-    line. RF inversion wants persistent per-step console lines, while still
-    keeping the preview callback independent.
-    """
     return range(max(0, int(num_steps)))
 
 def _rf_format_duration(seconds: float) -> str:
@@ -194,28 +320,23 @@ def _rf_format_duration(seconds: float) -> str:
 def _rf_progress_snapshot(step_i: int, total_steps: int, start_time: float, persistent: bool = False) -> None:
     total_steps = max(1, int(total_steps))
     step_i = max(0, min(int(step_i), total_steps))
-
     elapsed = max(0.0, time.time() - float(start_time))
     frac = step_i / total_steps
-
     bar_width = 70
     filled = int(round(bar_width * frac))
     bar = '█' * filled + ' ' * (bar_width - filled)
-
     percent = int(round(frac * 100.0))
     rate = step_i / elapsed if elapsed > 1e-9 else 0.0
     remaining = max(0.0, (total_steps - step_i) / rate) if step_i > 0 and rate > 1e-9 else 0.0
     rate_text = f'{rate:.2f}it/s' if rate >= 1.0 else f'{(1.0 / max(rate, 1e-9)):.2f}s/it'
-
     line = (
         f'RF inversion: {percent:3d}%|{bar}| '
         f'{step_i}/{total_steps} '
         f'[{_rf_format_duration(elapsed)}<{_rf_format_duration(remaining)}, {rate_text}]'
     )
-
     end = '\n' if persistent or step_i >= total_steps else '\r'
     print(line, end=end, flush=True)
-    
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Parameterization auto-detection
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -226,14 +347,8 @@ def _velocity_from_pred(
     sigma: float,
     parameterization: str,
 ) -> torch.Tensor:
-    """
-    Convert apply_model output to a velocity field regardless of parameterization.
-    """
     if parameterization == 'x0':
         return (x_sigma - pred) / max(float(sigma), 1e-7)
-    
-    # ComfyUI natively normalizes all velocity models (FLOW and V_PREDICTION) 
-    # to output the standard eps - x0 direction. No negation is needed.
     return pred
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,7 +358,6 @@ def _velocity_from_pred(
 _GAMMA_RF_MODES = {'rf_gamma', 'rf_gamma_rk2'}
 
 def _coerce_gamma_curve(value: Any = 0.0) -> float:
-    """Clamp gamma_curve to the supported range."""
     try:
         curve = float(value)
     except Exception:
@@ -256,7 +370,6 @@ def _normalize_rf_mode_and_gamma_curve(
     mode: str,
     gamma_curve: float = 0.0,
 ) -> Tuple[str, float]:
-    """Normalize the RF mode string and clamp gamma_curve."""
     mode = str(mode or 'rf_gamma')
     return mode, _coerce_gamma_curve(gamma_curve)
 
@@ -290,7 +403,6 @@ def _rf_linear_target(ref_clean: torch.Tensor, eps: torch.Tensor, sigma: float) 
     return (1.0 - sigma) * ref_clean + sigma * eps
 
 def _rf_match_mean_std(x: torch.Tensor, target: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
-    """Blend x toward target's per-sample mean/std. Prevents RF feature drift."""
     strength = max(0.0, min(1.0, float(strength)))
     if strength <= 0.0:
         return x
@@ -303,13 +415,10 @@ def _rf_match_mean_std(x: torch.Tensor, target: torch.Tensor, strength: float = 
     return (1.0 - strength) * x + strength * matched
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PMI — Proximal-Mean Inversion (Wang et al., ICLR 2026)
-# "Free Lunch for Stabilizing Rectified Flow Inversion"
-# https://arxiv.org/abs/2602.11850
+# PMI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _PMIState:
-    """Carries running velocity mean across steps for PMI inversion."""
     def __init__(self) -> None:
         self.v_mean: Optional[torch.Tensor] = None
         self.step_count: int = 0
@@ -324,40 +433,26 @@ class _PMIState:
         v_model: torch.Tensor,
         alpha: float = 0.5,
     ) -> torch.Tensor:
-        """
-        Update the running mean and return the PMI-corrected velocity.
-
-        alpha: blend weight toward the running mean (0 = pure model, 1 = pure mean).
-               Paper suggests ~0.3–0.5 gives best stability without loss of fidelity.
-        """
         alpha = max(0.0, min(1.0, float(alpha)))
+        k = self.step_count
 
-        k = self.step_count  # steps seen so far, 0-indexed before update
-
-        # ── Cumulative arithmetic mean (paper eq.) ───────────────────────
         if self.v_mean is None:
             self.v_mean = v_model.detach().clone()
             self.v_norm_sq_mean = float(v_model.detach().float().pow(2).mean().item())
             self.step_count = 1
             return v_model
 
-        # incremental update: v̄_k = v̄_{k-1} * (k-1)/k + v_k / k
         k_new = k + 1
-        self.v_mean = (self.v_mean * (k / k_new)
-                    + v_model.detach() * (1.0 / k_new)).to(
-                        device=v_model.device, dtype=v_model.dtype)
+        self.v_mean = (self.v_mean * (k / k_new) + v_model.detach() * (1.0 / k_new)).to(
+            device=v_model.device, dtype=v_model.dtype
+        )
         self.v_norm_sq_mean = (
             self.v_norm_sq_mean * (k / k_new)
             + float(v_model.detach().float().pow(2).mean().item()) * (1.0 / k_new)
         )
         self.step_count = k_new
 
-        # ── Linear blend toward mean ─────────────────────────────────────
         v_corrected = (1.0 - alpha) * v_model + alpha * self.v_mean
-
-        # ── Spherical Gaussian projection (paper constraint) ─────────────
-        # The paper keeps v_corrected within a ball of radius = ||v_model - v̄||
-        # centred on v̄, so the blend never overshoots the model velocity.
         delta_model = v_model - self.v_mean
         delta_corr  = v_corrected - self.v_mean
 
@@ -369,9 +464,9 @@ class _PMIState:
             v_corrected = self.v_mean + scale * delta_corr
 
         return v_corrected
-    
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main RF trajectory builder
+# RF Trajectory Builder
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _rf_build_cache_from_sampler_sigmas(
@@ -389,16 +484,8 @@ def _rf_build_cache_from_sampler_sigmas(
     gamma_curve:     float = 0.0,
     preview_callback: Optional[Callable[[int, torch.Tensor, torch.Tensor, int], None]] = None,
 ) -> Tuple[Dict[float, torch.Tensor], torch.Tensor, List[float]]:
-    """
-    Build reference x_sigma latents on the actual sampler sigma grid.
-    """
     norm_strength = _coerce_norm_strength(norm_strength)
     mode, gamma_curve = _normalize_rf_mode_and_gamma_curve(rf_mode, gamma_curve)
-    valid_modes = {'linear', 'rf_gamma', 'rf_gamma_rk2', 'fireflow'}
-    if mode not in valid_modes:
-        print(f'{_PREFIX}   ⚠ Unknown rf_mode={mode!r}; falling back to rf_gamma')
-        mode = 'rf_gamma'
-
     parameterization = getattr(stats, 'parameterization', 'unknown') if stats else 'unknown'
 
     device = ref_clean.device
@@ -409,7 +496,6 @@ def _rf_build_cache_from_sampler_sigmas(
         rng.manual_seed(seed)
         eps = torch.randn(ref_clean.shape, device=device, dtype=dtype, generator=rng)
 
-    # Build sorted unique sigma grid starting from 0.
     sigmas: List[float] = [0.0]
     for s in sampler_sigmas:
         try:
@@ -427,10 +513,8 @@ def _rf_build_cache_from_sampler_sigmas(
     failures = 0
     vm_sum = 0.0
     vp_sum = 0.0
-    # FireFlow state: stores midpoint velocity from previous step for reuse.
     next_step_velocity: Optional[torch.Tensor] = None
 
-    # PMI state. pmi_alpha is the on/off control: <= 0 means disabled.
     pmi_alpha_eff = max(0.0, min(1.0, float(pmi_alpha)))
     use_pmi = pmi_alpha_eff > 0.0
     pmi_state = _PMIState()
@@ -446,17 +530,6 @@ def _rf_build_cache_from_sampler_sigmas(
         previewed_steps.add(step_index)
         _rf_emit_preview(preview_callback, step_index, raw_pred, x_current, total_preview_steps)
 
-    _rf_vprint(stats,
-        f'{_PREFIX}   RF trajectory mode: {mode}  gamma={gamma:.4f}  '
-        f'gamma_curve={gamma_curve:.3f}  '
-        f'norm_strength={norm_strength:.3f}  '
-        f'norm={"on" if norm_strength > 0.0 else "off"}  '
-        f'parameterization={parameterization}\n'
-        f'{_PREFIX}   pmi_alpha={pmi_alpha_eff:.3f}  '
-        f'PMI={"on" if use_pmi else "off"}'
-    )
-
-    # Print persistent RF inversion progress snapshots. This keeps every RF step
     rf_total_steps = max(1, len(sigmas) - 1)
     rf_progress_start_time = time.time()
 
@@ -468,12 +541,10 @@ def _rf_build_cache_from_sampler_sigmas(
         delta      = float(sigma_cur - sigma_prev)
         z_prev     = z.detach().clone()
         gamma_eff  = _rf_gamma_for_mode(mode, gamma, sigma_prev, sigma_cur, gamma_curve)
-    
         vm_abs = 0.0
         vp_abs = 0.0
         extra  = ''
-    
-        # ── Helper: run model and convert output to velocity ─────────────────
+
         def _call_model_as_velocity(z_in, sigma_val, label=''):
             nonlocal model_ok, failures, vm_sum
             t_tensor = torch.full((z_in.shape[0],), sigma_val, device=device, dtype=dtype)
@@ -488,18 +559,16 @@ def _rf_build_cache_from_sampler_sigmas(
                     failures += 1
                     print(f'{_PREFIX}   [WARNING {mode}{label}] model failed at σ={sigma_val:.6f}: {exc}')
                     return torch.zeros_like(z_in), False, None
-    
+
         def _apply_pmi_if_enabled(v: torch.Tensor) -> torch.Tensor:
             if not use_pmi:
                 return v
             return pmi_state.update_and_correct(v, alpha=pmi_alpha_eff)
-    
+
         if mode == 'linear':
             z = _rf_linear_target(ref_clean, eps, sigma_cur)
             extra = 'linear_target'
-    
         elif mode == 'fireflow':
-            # ── (Deng et al., ICML 2025) ─────────
             if next_step_velocity is None:
                 v_pred, ok, raw_preview = _call_model_as_velocity(z, sigma_prev, ' fresh')
                 vm_abs = float(v_pred.abs().mean().item())
@@ -508,81 +577,56 @@ def _rf_build_cache_from_sampler_sigmas(
                 v_pred = next_step_velocity.to(device=device, dtype=dtype)
                 vm_abs = float(v_pred.abs().mean().item())
                 pred_source = 'reused_mid'
-    
+
             z_mid      = z + 0.5 * delta * v_pred
             sigma_mid  = sigma_prev + 0.5 * delta
             v_mid, ok, raw_preview_mid = _call_model_as_velocity(z_mid, sigma_mid, ' mid')
             vm_abs_mid = float(v_mid.abs().mean().item())
-    
+
             v_mid_total = _apply_pmi_if_enabled(v_mid)
             next_step_velocity = v_mid_total.detach().clone()
             z = z + delta * v_mid_total
             _preview_once(step_i - 1, raw_preview_mid, z)
-            extra = (
-                f'FireFlow pred={pred_source}  σ_mid={sigma_mid:.6f}  '
-                f'|v_pred|={vm_abs:.5f}  |v_mid|={vm_abs_mid:.5f}'
-            )
-            if use_pmi:
-                extra += f'  PMI step={pmi_state.step_count}'
-    
+            extra = f'FireFlow pred={pred_source} σ_mid={sigma_mid:.6f}'
         else:
-            # ── RF-style velocity  ─
             v_model, ok, raw_preview = _call_model_as_velocity(z, sigma_prev)
             vm_abs = float(v_model.abs().mean().item())
-    
+
             denom   = max(1.0 - sigma_prev, 1e-7)
             v_prior = (eps - z) / denom
             vp_abs  = float(v_prior.abs().mean().item())
             vp_sum += vp_abs
-    
+
             if mode == 'rf_gamma_rk2':
                 v1    = gamma_eff * v_model + (1.0 - gamma_eff) * v_prior
                 z_mid = z + 0.5 * delta * v1
                 sigma_mid = sigma_prev + 0.5 * delta
                 v_model_mid, ok_mid, raw_preview_mid = _call_model_as_velocity(z_mid, sigma_mid, ' mid')
                 vm_abs_mid = float(v_model_mid.abs().mean().item())
-    
+
                 denom_mid = max(1.0 - sigma_mid, 1e-7)
                 v_prior_mid = (eps - z_mid) / denom_mid
                 vp_abs_mid  = float(v_prior_mid.abs().mean().item())
                 vp_sum += vp_abs_mid
-    
+
                 v_total = gamma_eff * v_model_mid + (1.0 - gamma_eff) * v_prior_mid
                 v_total = _apply_pmi_if_enabled(v_total)
                 z = z + delta * v_total
                 _preview_once(step_i - 1, raw_preview_mid, z)
                 extra = f'mid |v_model_mid|={vm_abs_mid:.5f}'
-                if use_pmi:
-                    extra += f'  PMI step={pmi_state.step_count}'
             else:
                 v_total = gamma_eff * v_model + (1.0 - gamma_eff) * v_prior
                 v_total = _apply_pmi_if_enabled(v_total)
                 z = z + delta * v_total
                 _preview_once(step_i - 1, raw_preview, z)
-                if use_pmi:
-                    extra = f'PMI step={pmi_state.step_count}'
-    
+
         if norm_strength > 0.0:
             target = _rf_linear_target(ref_clean, eps, sigma_cur)
             z = _rf_match_mean_std(z, target, strength=norm_strength)
             extra = (extra + '  ' if extra else '') + f'norm={norm_strength:.2f}'
-    
+
         prev  = sigma_cur
-        z_mean = float(z.mean().item())
-        z_std  = float(z.std().item())
-        z_min  = float(z.min().item())
-        z_max  = float(z.max().item())
-        dz_abs = float((z - z_prev).abs().mean().item())
         cache[round(sigma_cur, 6)] = z.detach().clone()
-    
-        _rf_vprint(stats,
-            f'{_PREFIX}     z_sigma step {step_i:02d}/{len(sigmas)-1}: '
-            f'mode={mode}  γ_eff={gamma_eff:.4f}  '
-            f'σ_prev={sigma_prev:.6f} -> σ={sigma_cur:.6f}  Δσ={delta:.6f}  '
-            f'|model|={vm_abs:.5f}  |prior|={vp_abs:.5f}  |Δz|={dz_abs:.5f}  {extra}\n'
-            f'{_PREFIX}       z_σ mean={z_mean:.4f}  std={z_std:.4f}  '
-            f'min={z_min:.4f}  max={z_max:.4f}'
-        )
 
         _rf_progress_snapshot(
             step_i,
@@ -590,18 +634,6 @@ def _rf_build_cache_from_sampler_sigmas(
             rf_progress_start_time,
             persistent=_coerce_bool(getattr(stats, 'rf_verbose', False)),
         )
-    
-    steps = max(1, len(sigmas) - 1)
-    _rf_vprint(stats,
-        f'{_PREFIX}   RF schedule build: mode={mode}  sampler_sigmas={len(sampler_sigmas)}  '
-        f'unique={len(sigmas)}  rf_steps={len(sigmas)-1}  '
-        f'model_ok={model_ok}  failures={failures}\n'
-        f'{_PREFIX}     sigma_range=[{sigmas[0]:.6f}, {sigmas[-1]:.6f}]  '
-        f'|model|={vm_sum/max(1, model_ok):.5f}  |prior|={vp_sum/steps:.5f}  '
-        f'z_final std={z.std().item():.4f}  parameterization={parameterization}'
-    )
-    if failures > 0:
-        print(f'{_PREFIX}   ⚠ RF schedule warning: {failures} model call(s) failed.')
 
     return cache, eps, sigmas
 
@@ -620,10 +652,6 @@ def _rf_increment_reference_one_step(
     norm_strength: float = 0.0,
     preview_callback: Optional[Callable[[int, torch.Tensor, torch.Tensor, int], None]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Stable direct one-step RF reference latent for the CURRENT sampler sigma.
-    Used as a fallback when the sampler wrapper didn't capture the full sigma schedule.
-    """
     sigma_cur = max(0.0, min(1.0, float(sigma_cur)))
     delta_sigma = sigma_cur
 
@@ -642,16 +670,13 @@ def _rf_increment_reference_one_step(
         try:
             raw     = apply_model_fn(z_prev, t_tensor, **base_model_kwargs)
             v_model = _velocity_from_pred(z_prev, raw, 0.0, parameterization)
-            v_model_abs = float(v_model.abs().mean().item())
             model_ok = True
         except Exception as exc:
             print(f'{_PREFIX}   [WARNING direct RF] model call failed at σ=0.000000: {exc}')
             v_model = torch.zeros_like(z_prev)
-            v_model_abs = 0.0
             model_ok = False
 
     v_prior = eps - z_prev
-    v_prior_abs = float(v_prior.abs().mean().item())
     gamma_eff = _rf_gamma_for_mode(rf_mode, gamma, sigma_prev, sigma_cur, gamma_curve)
     v_total = gamma_eff * v_model + (1.0 - gamma_eff) * v_prior
     z_cur   = z_prev + delta_sigma * v_total
@@ -661,35 +686,25 @@ def _rf_increment_reference_one_step(
         z_cur = _rf_match_mean_std(z_cur, target, strength=norm_strength)
 
     _rf_emit_preview(preview_callback, 0, raw, z_cur, 1)
-
-    _rf_vprint(stats,
-        f'{_PREFIX}   RF direct σ_base=0.000000 -> σ={sigma_cur:.6f}  '
-        f'Δσ={delta_sigma:.6f}  gamma_eff={gamma_eff:.4f}  '
-        f'norm_strength={norm_strength:.3f}  '
-        f'model_ok={model_ok}  parameterization={parameterization}\n'
-        f'{_PREFIX}     |v_model|={v_model_abs:.5f}  |v_prior|={v_prior_abs:.5f}  '
-        f'z_cur std={z_cur.std().item():.4f}'
-    )
     return z_cur, eps
 
 def _normalize_sigma_float(value: Any) -> Optional[float]:
     try:
         if torch.is_tensor(value):
-            v = float(value.detach().float().mean().item())
+            viewer = float(value.detach().float().mean().item())
         else:
-            v = float(value)
-        if not math.isfinite(v):
+            viewer = float(value)
+        if not math.isfinite(viewer):
             return None
-        if 0.0 <= v <= 1.0:
-            return max(0.0, min(1.0, v))
-        if 1.0 < v <= 1000.0:
-            return max(0.0, min(1.0, v / 1000.0))
+        if 0.0 <= viewer <= 1.0:
+            return max(0.0, min(1.0, viewer))
+        if 1.0 < viewer <= 1000.0:
+            return max(0.0, min(1.0, viewer / 1000.0))
     except Exception:
         return None
     return None
 
 def _coerce_sigma_sequence(value: Any) -> Optional[List[float]]:
-    """Convert a scheduler sigma/timestep list into normalized [0,1] floats."""
     try:
         if value is None:
             return None
@@ -721,87 +736,16 @@ def _coerce_sigma_sequence(value: Any) -> Optional[List[float]]:
     except Exception:
         return None
 
-def _find_sigma_schedule(obj: Any, depth: int = 0) -> Optional[List[float]]:
-    if depth > 6 or obj is None:
-        return None
-
-    if isinstance(obj, dict):
-        preferred = (
-            'sample_sigmas', 'sampler_sigmas', 'sigmas', 'scheduler_sigmas',
-            'denoise_sigmas', 'noise_sigmas', 'timesteps', 'timestep_schedule',
-        )
-        for key in preferred:
-            if key in obj:
-                seq = _coerce_sigma_sequence(obj.get(key))
-                if seq is not None:
-                    return seq
-        for key, value in obj.items():
-            key_l = str(key).lower()
-            if any(word in key_l for word in ('sigma', 'timestep', 'schedule')):
-                seq = _coerce_sigma_sequence(value)
-                if seq is not None:
-                    return seq
-            if isinstance(value, dict):
-                found = _find_sigma_schedule(value, depth + 1)
-                if found is not None:
-                    return found
-            elif isinstance(value, (list, tuple)) and any(
-                word in key_l for word in ('sigma', 'timestep', 'schedule')
-            ):
-                found = _find_sigma_schedule(value, depth + 1)
-                if found is not None:
-                    return found
-
-    if isinstance(obj, (list, tuple)):
-        seq = _coerce_sigma_sequence(obj)
-        if seq is not None:
-            return seq
-        for item in obj:
-            if isinstance(item, dict):
-                found = _find_sigma_schedule(item, depth + 1)
-                if found is not None:
-                    return found
-    return None
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# Utility helpers
+# Comfy Model Extraction Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _safe_get_diffusion_model(model_patcher: Any) -> Any:
-    roots = []
-    if hasattr(model_patcher, 'model'):
-        roots.append(model_patcher.model)
-    roots.append(model_patcher)
-    attr_paths = [
-        'diffusion_model', 'model.diffusion_model',
-        'model.model.diffusion_model', 'inner_model.diffusion_model',
-        'model.inner_model.diffusion_model',
-    ]
-    for root in roots:
-        for path in attr_paths:
-            obj, ok = root, True
-            for part in path.split('.'):
-                if not hasattr(obj, part):
-                    ok = False; break
-                obj = getattr(obj, part)
-            if ok and hasattr(obj, 'patchify_and_embed') and hasattr(obj, 'layers'):
-                return obj
-    seen: set = set()
-    stack = roots[:]
-    while stack and len(seen) < 256:
-        obj = stack.pop()
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        if hasattr(obj, 'patchify_and_embed') and hasattr(obj, 'layers'):
-            return obj
-        for name in ('model', 'inner_model', 'diffusion_model', 'unet', 'wrapped'):
-            if hasattr(obj, name):
-                try:
-                    stack.append(getattr(obj, name))
-                except Exception:
-                    pass
-    raise RuntimeError('Could not find Z-Image/NextDiT diffusion model.')
+    if hasattr(model_patcher, 'model') and hasattr(model_patcher.model, 'diffusion_model'):
+        return model_patcher.model.diffusion_model
+    if hasattr(model_patcher, 'diffusion_model'):
+        return model_patcher.diffusion_model
+    raise RuntimeError('Could not find standard diffusion model.')
 
 def _repeat_to_batch(x: torch.Tensor, batch: int) -> torch.Tensor:
     if x.shape[0] == batch:
@@ -852,10 +796,11 @@ def _build_rf_conditioning_kwargs(
     target_b: int,
 ) -> Tuple[Dict[str, Any], str]:
     try:
-        if ref_conditioning is not None and target_b > 0:
-            merged, _forced = _merge_reference_conditioning_into_c(c, ref_conditioning, target_b)
-            ref_only = _slice_conditioning_batch(merged, target_b, target_b * 2)
-            return _clone_conditioning_for_rf(ref_only), 'reference'
+        if ref_conditioning is None:
+            ref_conditioning = c
+        merged, _forced = _merge_reference_conditioning_into_c(c, ref_conditioning, target_b)
+        ref_only = _slice_conditioning_batch(merged, target_b, target_b * 2)
+        return _clone_conditioning_for_rf(ref_only), 'reference'
     except Exception as exc:
         print(f'{_PREFIX}   ⚠ RF conditioning fallback: {exc}')
     return _clone_conditioning_for_rf(c), 'target-fallback'
@@ -875,60 +820,14 @@ def _sigma_from_timestep(timestep: torch.Tensor) -> float:
 def _sigma_to_progress(timestep: torch.Tensor) -> float:
     return max(0.0, min(1.0, 1.0 - _sigma_from_timestep(timestep)))
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reference Conditioning Integration
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _lerp(a: float, b: float, t: float) -> float:
-    return float(a + (b - a) * t)
-
-def _repeat_conditioning_tree(obj: Any, src: int, tgt: int) -> Any:
-    if torch.is_tensor(obj):
-        try:
-            if obj.ndim > 0 and int(obj.shape[0]) == src:
-                return _repeat_to_batch(obj, tgt)
-        except Exception:
-            pass
-        return obj
-    if isinstance(obj, dict):
-        return {
-            k: v if k in ('transformer_options', 'ref_latents', 'ref_contexts')
-            else _repeat_conditioning_tree(v, src, tgt)
-            for k, v in obj.items()
-        }
-    if isinstance(obj, list):
-        return [_repeat_conditioning_tree(v, src, tgt) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_repeat_conditioning_tree(v, src, tgt) for v in obj)
-    return obj
-
-_TEXT_CONDITIONING_KEYS = {
-    'c_crossattn', 'crossattn', 'context', 'cap_feats', 'cond',
-    'encoder_hidden_states', 'txt', 'text', 'text_embeddings',
-}
-_POOLED_CONDITIONING_KEYS = {
-    'pooled_output', 'clip_pooled', 'pooled', 'y', 'vector',
-}
-_MASK_CONDITIONING_KEYS = {
-    'attention_mask', 'crossattn_mask', 'c_crossattn_mask',
-    'cap_mask', 'cond_mask', 'mask',
-}
-_NUM_TOKEN_KEYS = {
-    'num_tokens', 'tokens_num', 'n_tokens', 'cap_num_tokens',
-}
-_CONDITIONING_META_ALIASES = {
-    'pooled_output': ('pooled_output', 'clip_pooled', 'pooled', 'y', 'vector'),
-    'clip_pooled':   ('clip_pooled',   'pooled_output', 'pooled', 'y', 'vector'),
-    'pooled':        ('pooled',        'pooled_output', 'clip_pooled', 'y', 'vector'),
-    'y':             ('y',             'pooled_output', 'clip_pooled', 'pooled', 'vector'),
-    'vector':        ('vector',        'pooled_output', 'clip_pooled', 'pooled', 'y'),
-    'attention_mask':   ('attention_mask',   'crossattn_mask', 'c_crossattn_mask', 'cap_mask', 'mask'),
-    'crossattn_mask':   ('crossattn_mask',   'attention_mask', 'c_crossattn_mask', 'cap_mask', 'mask'),
-    'c_crossattn_mask': ('c_crossattn_mask', 'attention_mask', 'crossattn_mask',   'cap_mask', 'mask'),
-    'cap_mask':         ('cap_mask',         'attention_mask', 'crossattn_mask',   'c_crossattn_mask', 'mask'),
-    'mask':             ('mask',             'attention_mask', 'crossattn_mask',   'c_crossattn_mask', 'cap_mask'),
-    'num_tokens':     ('num_tokens',     'tokens_num', 'n_tokens', 'cap_num_tokens'),
-    'tokens_num':     ('tokens_num',     'num_tokens', 'n_tokens', 'cap_num_tokens'),
-    'n_tokens':       ('n_tokens',       'num_tokens', 'tokens_num', 'cap_num_tokens'),
-    'cap_num_tokens': ('cap_num_tokens', 'num_tokens', 'tokens_num', 'n_tokens'),
-}
+_TEXT_CONDITIONING_KEYS = {'c_crossattn', 'crossattn', 'context', 'cap_feats', 'cond'}
+_POOLED_CONDITIONING_KEYS = {'pooled_output', 'clip_pooled', 'pooled', 'y', 'vector'}
+_MASK_CONDITIONING_KEYS = {'attention_mask', 'crossattn_mask', 'c_crossattn_mask'}
+_NUM_TOKEN_KEYS = {'num_tokens', 'tokens_num', 'n_tokens'}
 
 def _first_tensor_in_conditioning_entry(entry: Any) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
     meta: Dict[str, Any] = {}
@@ -944,21 +843,6 @@ def _first_tensor_in_conditioning_entry(entry: Any) -> Tuple[Optional[torch.Tens
             if torch.is_tensor(value) and value.ndim >= 2:
                 return value, meta
         return None, meta
-    if isinstance(entry, (list, tuple)):
-        cond: Optional[torch.Tensor] = None
-        for item in entry:
-            if torch.is_tensor(item) and cond is None:
-                cond = item
-            elif isinstance(item, dict):
-                meta.update(item)
-        if cond is not None:
-            return cond, meta
-        for item in entry:
-            cond, nested_meta = _first_tensor_in_conditioning_entry(item)
-            if nested_meta:
-                meta.update(nested_meta)
-            if cond is not None:
-                return cond, nested_meta
     return None, meta
 
 def _extract_reference_conditioning(ref_conditioning: Any) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
@@ -974,312 +858,77 @@ def _extract_reference_conditioning(ref_conditioning: Any) -> Tuple[Optional[tor
                 merged_meta.update(meta)
             if cond is not None:
                 return cond, merged_meta
-        return None, merged_meta
     return None, {}
 
-def _meta_get(meta: Dict[str, Any], key: str) -> Any:
-    for alias in _CONDITIONING_META_ALIASES.get(key, (key,)):
-        if alias in meta:
-            return meta[alias]
-    return None
-
-def _as_tensor_like(value: Any, like: torch.Tensor) -> Optional[torch.Tensor]:
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        return value.to(
-            device=like.device,
-            dtype=like.dtype if value.is_floating_point() else value.dtype,
-        )
-    try:
-        return torch.as_tensor(value, device=like.device)
-    except Exception:
-        return None
-
-def _coerce_ref_tensor_like_target(ref_value, target_value, target_b):
-    ref = ref_value.to(
-        device=target_value.device,
-        dtype=target_value.dtype if ref_value.is_floating_point() else ref_value.dtype,
-    )
-    if target_value.ndim >= 2 and ref.ndim == target_value.ndim - 1:
-        ref = ref.unsqueeze(0)
-    if ref.ndim > 0 and int(ref.shape[0]) != target_b:
-        ref = _repeat_to_batch(ref, target_b)
-    if target_value.ndim >= 3 and ref.ndim >= 3:
-        if int(ref.shape[1]) != int(target_value.shape[1]):
-            ref = _pad_or_truncate_tokens(ref, int(target_value.shape[1]))
-    elif target_value.ndim >= 2 and ref.ndim >= 2:
-        if int(ref.shape[1]) != int(target_value.shape[1]):
-            ref = _pad_or_truncate_tokens(ref, int(target_value.shape[1]))
-    return ref
-
-def _conditioning_mask_from_source(source, batch, padded_tokens, device):
-    if source is None:
-        return None
-    if torch.is_tensor(source):
-        x = source.detach().to(device=device)
-        if x.ndim == 0:
-            return _num_tokens_to_valid_mask(x, batch, padded_tokens, device)
-        if x.ndim == 1:
-            if x.numel() == batch and not x.is_floating_point():
-                return _num_tokens_to_valid_mask(x, batch, padded_tokens, device)
-            if x.numel() == 1:
-                return _num_tokens_to_valid_mask(x, batch, padded_tokens, device)
-            x = x.view(1, -1)
-        if x.ndim > 2:
-            x = x.reshape(x.shape[0], -1)
-        if int(x.shape[0]) != batch:
-            x = _repeat_to_batch(x, batch)
-        if int(x.shape[1]) != padded_tokens:
-            x = _pad_or_truncate_tokens(x, padded_tokens)
-        if x.is_floating_point() and torch.any(x < 0):
-            return (x >= 0).to(torch.bool)
-        return x.to(torch.bool)
-    if isinstance(source, (list, tuple)):
-        try:
-            return _conditioning_mask_from_source(
-                torch.as_tensor(source, device=device), batch, padded_tokens, device
-            )
-        except Exception:
-            return None
-    try:
-        return _num_tokens_to_valid_mask(int(source), batch, padded_tokens, device)
-    except Exception:
-        return None
-
-def _target_valid_mask_from_c(c, target_b, padded_tokens, device):
-    for key in ('attention_mask', 'crossattn_mask', 'c_crossattn_mask', 'cap_mask', 'mask'):
-        mask = _conditioning_mask_from_source(c.get(key), target_b, padded_tokens, device)
-        if mask is not None:
-            return mask
-    for key in ('num_tokens', 'tokens_num', 'n_tokens', 'cap_num_tokens'):
-        mask = _conditioning_mask_from_source(c.get(key), target_b, padded_tokens, device)
-        if mask is not None:
-            return mask
-    return torch.ones((target_b, padded_tokens), device=device, dtype=torch.bool)
-
-def _reference_valid_mask_from_conditioning(ref_cond, ref_meta, target_b, padded_tokens, device):
-    for key in ('attention_mask', 'crossattn_mask', 'c_crossattn_mask', 'cap_mask', 'mask'):
-        mask = _conditioning_mask_from_source(
-            _meta_get(ref_meta, key), target_b, padded_tokens, device
-        )
-        if mask is not None:
-            return mask
-    for key in ('num_tokens', 'tokens_num', 'n_tokens', 'cap_num_tokens'):
-        mask = _conditioning_mask_from_source(
-            _meta_get(ref_meta, key), target_b, padded_tokens, device
-        )
-        if mask is not None:
-            return mask
-    real_tokens = int(ref_cond.shape[1]) if ref_cond.ndim >= 2 else padded_tokens
-    return _num_tokens_to_valid_mask(real_tokens, target_b, padded_tokens, device)
-
-def _conditioning_counts_from_mask(mask):
-    m = mask.to(torch.bool)
-    if m.ndim == 1:
-        m = m.view(1, -1)
-    return m.long().sum(dim=1)
-
-def _concat_batch_conditioning_value(key, value, ref_cond, ref_meta, target_b, forced_cap_mask):
-    if not torch.is_tensor(value):
-        if key in _NUM_TOKEN_KEYS:
-            try:
-                target_counts = torch.as_tensor(
-                    value, device=forced_cap_mask.device, dtype=torch.long,
-                ).flatten()
-                if target_counts.numel() == 1:
-                    target_counts = target_counts.repeat(target_b)
-                elif target_counts.numel() != target_b:
-                    target_counts = _repeat_to_batch(
-                        target_counts.view(-1, 1), target_b
-                    ).flatten()
-                ref_counts = _conditioning_counts_from_mask(
-                    forced_cap_mask[target_b:target_b * 2]
-                )
-                return torch.cat([target_counts, ref_counts], dim=0)
-            except Exception:
-                return _repeat_conditioning_tree(value, target_b, target_b * 2)
-        if key in _MASK_CONDITIONING_KEYS:
-            return forced_cap_mask
-        return _repeat_conditioning_tree(value, target_b, target_b * 2)
-
-    try:
-        if value.ndim == 0 or int(value.shape[0]) != target_b:
-            return value
-    except Exception:
-        return value
-
-    ref_value: Optional[torch.Tensor] = None
-
-    if key in _TEXT_CONDITIONING_KEYS or (
-        value.ndim >= 3 and ref_cond.ndim >= 3
-        and int(value.shape[-1]) == int(ref_cond.shape[-1])
-    ):
-        ref_value = ref_cond
-    elif key in _POOLED_CONDITIONING_KEYS:
-        meta_value = _meta_get(ref_meta, key)
-        if meta_value is not None:
-            ref_value = _as_tensor_like(meta_value, value)
-    elif key in _MASK_CONDITIONING_KEYS:
-        ref_value = forced_cap_mask[target_b:target_b * 2].to(
-            device=value.device,
-            dtype=value.dtype if value.is_floating_point() else torch.bool,
-        )
-        if value.is_floating_point() and torch.any(value < 0):
-            ref_value = _mask_to_additive(ref_value.to(torch.bool), dtype=value.dtype)
-    elif key in _NUM_TOKEN_KEYS:
-        ref_value = _conditioning_counts_from_mask(
-            forced_cap_mask[target_b:target_b * 2]
-        ).to(device=value.device, dtype=value.dtype)
-
-    if ref_value is None:
-        ref_value = value
-
-    ref_value = _coerce_ref_tensor_like_target(ref_value, value, target_b)
-    return torch.cat([value, ref_value], dim=0)
-
 def _merge_reference_conditioning_into_c(c, ref_conditioning, target_b):
+    if ref_conditioning is None or ref_conditioning is c:
+        out: Dict[str, Any] = {}
+        for key, value in c.items():
+            if key == 'transformer_options':
+                out[key] = value
+                continue
+            if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == target_b:
+                out[key] = torch.cat([value, value], dim=0)
+            else:
+                out[key] = value
+                
+        for key in ('c_crossattn', 'crossattn', 'context', 'cap_feats', 'cond'):
+            val = c.get(key)
+            if torch.is_tensor(val):
+                forced_cap_mask = torch.ones((target_b * 2, val.shape[1]), device=val.device, dtype=torch.bool)
+                return out, forced_cap_mask
+        forced_cap_mask = torch.ones((target_b * 2, 512), device=torch.device("cpu"), dtype=torch.bool)
+        return out, forced_cap_mask
+
     ref_cond, ref_meta = _extract_reference_conditioning(ref_conditioning)
     if ref_cond is None:
-        raise RuntimeError(
-            'ref_conditioning must be connected and must contain a valid '
-            'CONDITIONING tensor when reference_latent is connected.'
-        )
+        return _merge_reference_conditioning_into_c(c, None, target_b)
 
     target_text = None
-    for key in ('c_crossattn', 'crossattn', 'context', 'cap_feats', 'cond',
-                'encoder_hidden_states'):
+    for key in ('c_crossattn', 'crossattn', 'context', 'cap_feats', 'cond'):
         value = c.get(key)
-        if (torch.is_tensor(value) and value.ndim >= 3
-                and int(value.shape[0]) == target_b):
+        if torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[0]) == target_b:
             target_text = value
             break
 
     if target_text is None:
-        for key, value in c.items():
-            if (
-                key != 'transformer_options'
-                and torch.is_tensor(value)
-                and value.ndim >= 3
-                and int(value.shape[0]) == target_b
-                and ref_cond.ndim >= 3
-                and int(value.shape[-1]) == int(ref_cond.shape[-1])
-            ):
-                target_text = value
-                break
-
-    if target_text is None:
-        raise RuntimeError(
-            'Could not find the target text-conditioning tensor in model kwargs.'
-        )
+        return _merge_reference_conditioning_into_c(c, None, target_b)
 
     if ref_cond.ndim == target_text.ndim - 1:
         ref_cond = ref_cond.unsqueeze(0)
-
-    if ref_cond.ndim < 3 or int(ref_cond.shape[-1]) != int(target_text.shape[-1]):
-        raise RuntimeError(
-            f'ref_conditioning incompatible shape {tuple(ref_cond.shape)} '
-            f'vs {tuple(target_text.shape)}.'
-        )
-
-    padded_tokens   = int(target_text.shape[1])
-    device          = target_text.device
-    target_mask     = _target_valid_mask_from_c(c, target_b, padded_tokens, device)
-    ref_mask        = _reference_valid_mask_from_conditioning(
-        ref_cond, ref_meta, target_b, padded_tokens, device
-    )
-    forced_cap_mask = torch.cat([target_mask, ref_mask], dim=0).to(torch.bool)
 
     out: Dict[str, Any] = {}
     for key, value in c.items():
         if key == 'transformer_options':
             out[key] = value
             continue
-        out[key] = _concat_batch_conditioning_value(
-            key, value, ref_cond, ref_meta, target_b, forced_cap_mask
-        )
+        if torch.is_tensor(value) and value.ndim > 0 and int(value.shape[0]) == target_b:
+            if key in _TEXT_CONDITIONING_KEYS:
+                ref_part = _repeat_to_batch(ref_cond, target_b)
+                if ref_part.shape[1] != value.shape[1]:
+                    pad_len = max(ref_part.shape[1], value.shape[1])
+                    if value.shape[1] < pad_len:
+                        value = torch.nn.functional.pad(value, (0, 0, 0, pad_len - value.shape[1]))
+                    if ref_part.shape[1] < pad_len:
+                        ref_part = torch.nn.functional.pad(ref_part, (0, 0, 0, pad_len - ref_part.shape[1]))
+                out[key] = torch.cat([value, ref_part], dim=0)
+            elif key in _POOLED_CONDITIONING_KEYS:
+                ref_val = ref_meta.get(key, value)
+                if torch.is_tensor(ref_val):
+                    ref_part = _repeat_to_batch(ref_val, target_b).to(device=value.device, dtype=value.dtype)
+                    out[key] = torch.cat([value, ref_part], dim=0)
+                else:
+                    out[key] = torch.cat([value, value], dim=0)
+            else:
+                out[key] = torch.cat([value, value], dim=0)
+        else:
+            out[key] = value
+
+    forced_cap_mask = torch.ones((target_b * 2, target_text.shape[1]), device=target_text.device, dtype=torch.bool)
     return out, forced_cap_mask
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Token / mask helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _pad_or_truncate_tokens(x: torch.Tensor, target_tokens: int) -> torch.Tensor:
-    if x.ndim < 2:
-        return x
-    cur = int(x.shape[1])
-    if cur == target_tokens:
-        return x
-    if cur > target_tokens:
-        return x[:, :target_tokens, ...]
-    pad_shape    = list(x.shape)
-    pad_shape[1] = target_tokens - cur
-    pad = torch.zeros(pad_shape, device=x.device, dtype=x.dtype)
-    return torch.cat([x, pad], dim=1)
-
-def _num_tokens_to_valid_mask(num_tokens, batch, padded_tokens, device):
-    if torch.is_tensor(num_tokens):
-        counts = num_tokens.detach().to(device=device).flatten().long()
-        if counts.numel() == 1:
-            counts = counts.repeat(batch)
-        elif counts.numel() != batch:
-            counts = _repeat_to_batch(counts.view(-1, 1), batch).flatten().long()
-    elif isinstance(num_tokens, (list, tuple)):
-        counts = torch.tensor(num_tokens, device=device, dtype=torch.long).flatten()
-        if counts.numel() == 1:
-            counts = counts.repeat(batch)
-        elif counts.numel() != batch:
-            counts = _repeat_to_batch(counts.view(-1, 1), batch).flatten().long()
-    else:
-        counts = torch.full(
-            (batch,),
-            int(num_tokens) if num_tokens is not None else padded_tokens,
-            device=device, dtype=torch.long,
-        )
-    counts = counts.clamp(min=0, max=padded_tokens)
-    ar = torch.arange(padded_tokens, device=device).view(1, padded_tokens)
-    return ar < counts.view(batch, 1)
-
-def _coerce_forced_cap_mask_for_feats(forced_cap_mask, cap_feats):
-    mask = forced_cap_mask.to(device=cap_feats.device)
-    if mask.ndim == 1:
-        mask = mask.view(1, -1)
-    if mask.ndim > 0 and int(mask.shape[0]) != int(cap_feats.shape[0]):
-        mask = _repeat_to_batch(mask, int(cap_feats.shape[0]))
-    if mask.ndim == 2 and int(mask.shape[1]) != int(cap_feats.shape[1]):
-        mask = _pad_or_truncate_tokens(mask, int(cap_feats.shape[1]))
-    return mask.to(torch.bool)
-
-def _mask_to_additive(valid_mask, dtype=torch.float32):
-    valid = valid_mask.to(torch.bool)
-    out   = torch.zeros(valid.shape, device=valid.device, dtype=dtype)
-    return out.masked_fill(~valid, -10000.0)
-
-def _build_joint_additive_mask_from_cap_mask(
-    cap_valid_mask, seq_len, text_range, device, dtype=torch.float32
-):
-    if not torch.is_tensor(cap_valid_mask) or cap_valid_mask.ndim < 2:
-        return None
-    if text_range is None:
-        return None
-    ts, te = int(text_range[0]), int(text_range[1])
-    ts = max(0, min(ts, int(seq_len)))
-    te = max(ts, min(te, int(seq_len)))
-    if te <= ts:
-        return None
-    cap_valid_mask = cap_valid_mask.to(device=device).to(torch.bool)
-    batch      = int(cap_valid_mask.shape[0])
-    text_slots = te - ts
-    text_valid = torch.zeros((batch, text_slots), device=device, dtype=torch.bool)
-    copy_len   = min(text_slots, int(cap_valid_mask.shape[1]))
-    if copy_len > 0:
-        text_valid[:, :copy_len] = cap_valid_mask[:, :copy_len]
-    full_valid = torch.ones((batch, int(seq_len)), device=device, dtype=torch.bool)
-    full_valid[:, ts:te] = text_valid
-    return _mask_to_additive(full_valid, dtype=dtype)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# RoPE frequency scale vector
+# Position frequency scaling logic
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_frequency_scale_vector(
@@ -1315,463 +964,10 @@ def _build_frequency_scale_vector(
     return torch.nn.functional.pad(out, (0, head_dim - out.numel()), value=1.0)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AdaIN helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _adain(target, style, eps=1e-6):
-    t_mean = target.mean(dim=1, keepdim=True)
-    s_mean = style.mean(dim=1, keepdim=True)
-    t_std  = target.float().var(dim=1, keepdim=True, unbiased=False).add(eps).sqrt().to(target.dtype)
-    s_std  = style.float().var(dim=1, keepdim=True, unbiased=False).add(eps).sqrt().to(target.dtype)
-    return (target - t_mean) / t_std * s_std + s_mean
-
-def _cross_batch_adain_qk(xq, xk, cfg, target_bsz, strength, eps=1e-6):
-    if target_bsz <= 0 or xq.shape[0] < target_bsz * 2:
-        return xq, xk
-    a = max(0.0, min(1.0, strength))
-    if a <= 0.0:
-        return xq, xk
-    seqlen = xq.shape[1]
-    for s, e in (cfg.get('target_qk_adain_ranges') or []):
-        s, e = max(0, int(s)), min(int(e), seqlen)
-        if e <= s:
-            continue
-        q_t, k_t = xq[:target_bsz, s:e], xk[:target_bsz, s:e]
-        q_r, k_r = xq[target_bsz:target_bsz*2, s:e], xk[target_bsz:target_bsz*2, s:e]
-        xq[:target_bsz, s:e] = q_t * (1 - a) + _adain(q_t, q_r, eps) * a
-        xk[:target_bsz, s:e] = k_t * (1 - a) + _adain(k_t, k_r, eps) * a
-    return xq, xk
-
-def _repeat_kv_heads_if_needed(k, v, q_heads):
-    kv = k.shape[2]
-    if kv == q_heads:
-        return k, v
-    if q_heads % kv != 0:
-        raise RuntimeError(f'Cannot expand KV heads: q={q_heads}, kv={kv}')
-    n = q_heads // kv
-    k = k.unsqueeze(3).repeat(1, 1, 1, n, 1).flatten(2, 3)
-    v = v.unsqueeze(3).repeat(1, 1, 1, n, 1).flatten(2, 3)
-    return k, v
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Architecture detection
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _is_joint_attention(m):
-    return (
-        hasattr(m, 'qkv') and hasattr(m, 'out')
-        and hasattr(m, 'q_norm') and hasattr(m, 'k_norm')
-        and hasattr(m, 'n_local_heads') and hasattr(m, 'n_local_kv_heads')
-        and hasattr(m, 'head_dim')
-        and callable(getattr(m, 'forward', None))
-    )
-
-def _is_main_layers_attention_name(name, min_layer=0, max_layer=29):
-    parts = name.split('.')
-    if len(parts) != 3:
-        return False
-    if parts[0] != 'layers' or parts[2] != 'attention':
-        return False
-    try:
-        idx = int(parts[1])
-    except Exception:
-        return False
-    return min_layer <= idx <= max_layer
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Context-refiner cap_mask patch
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _patch_context_refiner_mask_modules(dm, stats):
-    refiner = getattr(dm, 'context_refiner', None)
-    if refiner is None:
-        return 0, 0, 0
-    try:
-        modules = list(refiner)
-    except Exception:
-        modules = [refiner]
-    matched = installed = restored = 0
-    for idx, module in enumerate(modules):
-        if not hasattr(module, 'forward') or not callable(getattr(module, 'forward', None)):
-            continue
-        matched += 1
-        if hasattr(module, '_untwist_orig_context_refiner_forward'):
-            module.forward = module._untwist_orig_context_refiner_forward
-            restored += 1
-        else:
-            module._untwist_orig_context_refiner_forward = module.forward
-        original_forward = module._untwist_orig_context_refiner_forward
-
-        def make_forward(orig, layer_index):
-            def patched_forward(self, *args, **kwargs):
-                transformer_options = kwargs.get('transformer_options', None)
-                if transformer_options is None and len(args) >= 4 and isinstance(args[3], dict):
-                    transformer_options = args[3]
-                cfg = (
-                    transformer_options.get('untwisting_rope_zimage')
-                    if isinstance(transformer_options, dict) else None
-                )
-                forced_cap_mask = (
-                    cfg.get('forced_cap_mask', None) if isinstance(cfg, dict) else None
-                )
-                if torch.is_tensor(forced_cap_mask):
-                    args_list = list(args)
-                    cap_feats = (
-                        args_list[0]
-                        if len(args_list) >= 1 and torch.is_tensor(args_list[0])
-                        else None
-                    )
-                    if cap_feats is not None:
-                        replacement_mask = _coerce_forced_cap_mask_for_feats(
-                            forced_cap_mask, cap_feats
-                        )
-                        substituted = False
-                        
-                        # Helper to ensure the replacement mask matches the expected attention shape
-                        def _align_mask(orig_m):
-                            if torch.is_tensor(orig_m):
-                                try:
-                                    return replacement_mask.view(orig_m.shape)
-                                except Exception:
-                                    pass
-                            if replacement_mask.ndim == 2:
-                                return replacement_mask.unsqueeze(1).unsqueeze(1)
-                            return replacement_mask
-
-                        if len(args_list) >= 2:
-                            if args_list[1] is None or torch.is_tensor(args_list[1]):
-                                args_list[1] = _align_mask(args_list[1])
-                                substituted  = True
-                        else:
-                            for key in ('cap_mask', 'mask', 'x_mask'):
-                                if key in kwargs and (
-                                    kwargs[key] is None or torch.is_tensor(kwargs[key])
-                                ):
-                                    kwargs[key] = _align_mask(kwargs[key])
-                                    substituted = True
-                                    break
-                        if substituted:
-                            stats.context_refiner_calls += 1
-                            return orig(*args_list, **kwargs)
-                return orig(*args, **kwargs)
-            return patched_forward
-
-        module.forward = types.MethodType(make_forward(original_forward, idx), module)
-        installed += 1
-
-    _vprint(stats,
-        f'{_PREFIX} Context-refiner mask patch: '
-        f'matched={matched} installed={installed} restored={restored}')
-    return matched, installed, restored
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# patchify_and_embed patch
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _patch_patchify_and_embed(dm, stats):
-    if hasattr(dm, '_untwist_orig_patchify'):
-        dm.patchify_and_embed = dm._untwist_orig_patchify
-    else:
-        dm._untwist_orig_patchify = dm.patchify_and_embed
-    original = dm._untwist_orig_patchify
-
-    def patched(self, x, cap_feats, cap_mask, t, num_tokens,
-                ref_latents=[], ref_contexts=[], siglip_feats=[],
-                transformer_options={}, *args, **kwargs):
-
-        cfg_pre = (
-            transformer_options.get('untwisting_rope_zimage')
-            if isinstance(transformer_options, dict) else None
-        )
-        forced_cap_mask = (
-            cfg_pre.get('forced_cap_mask', None) if isinstance(cfg_pre, dict) else None
-        )
-
-        if torch.is_tensor(forced_cap_mask):
-            cap_mask = forced_cap_mask.to(device=cap_feats.device)
-            if cap_mask.ndim == 1:
-                cap_mask = cap_mask.view(1, -1)
-            if cap_mask.ndim > 0 and int(cap_mask.shape[0]) != int(cap_feats.shape[0]):
-                cap_mask = _repeat_to_batch(cap_mask, int(cap_feats.shape[0]))
-            if cap_mask.ndim == 2 and int(cap_mask.shape[1]) != int(cap_feats.shape[1]):
-                cap_mask = _pad_or_truncate_tokens(cap_mask, int(cap_feats.shape[1]))
-
-        result = original(x, cap_feats, cap_mask, t, num_tokens, *args,
-                          ref_latents=ref_latents, ref_contexts=ref_contexts,
-                          siglip_feats=siglip_feats,
-                          transformer_options=transformer_options, **kwargs)
-        stats.patchify_calls += 1
-
-        try:
-            img, mask, img_size, cap_size, freqs_cis, timestep_zero_index = result
-            cfg = transformer_options.get('untwisting_rope_zimage')
-            if not cfg or not cfg.get('enabled'):
-                return result
-
-            cfg['axes_dims'] = list(getattr(self, 'axes_dims', []))
-            cfg['head_dim']  = (int(getattr(self, 'dim', 0))
-                                // max(1, int(getattr(self, 'n_heads', 1))))
-            cfg['seq_len']   = int(img.shape[1])
-            cfg['patch_size']= int(getattr(self, 'patch_size', 2))
-            try:
-                cfg['rope_theta'] = float(
-                    getattr(getattr(self, 'rope_embedder', None), 'theta', 10000.0)
-                )
-            except Exception:
-                cfg['rope_theta'] = 10000.0
-
-            p = cfg['patch_size']
-            target_range = target_text_range = None
-            ref_ranges:      List[Tuple[int,int]] = []
-            ref_real_ranges: List[Tuple[int,int]] = []
-
-            if timestep_zero_index:
-                target_range = tuple(int(v) for v in timestep_zero_index[0])
-                if len(timestep_zero_index) > 1:
-                    target_text_range = tuple(int(v) for v in timestep_zero_index[1])
-            else:
-                try:
-                    cap0 = int(cap_size[0]) if isinstance(cap_size, (list, tuple)) else int(cap_size)
-                except Exception:
-                    cap0 = 0
-                target_text_range = (0, cap0) if cap0 > 0 else None
-                target_range = (max(0, cap0), int(img.shape[1]))
-
-            real_range = target_range
-            if target_range is not None:
-                ts, te = int(target_range[0]), int(target_range[1])
-                try:
-                    real_tok   = (x.shape[-2] // p) * (x.shape[-1] // p)
-                    real_range = (ts, min(ts + real_tok, te))
-                except Exception:
-                    real_range = target_range
-                cfg['target_real_range'] = real_range
-                ref_ranges.append((ts, te))
-                ref_real_ranges.append(real_range)
-
-            cfg.update({
-                'ref_k_ranges':           ref_ranges,
-                'ref_real_ranges':        ref_real_ranges,
-                'target_range':           target_range,
-                'target_text_range':      target_text_range,
-                'target_qk_adain_ranges':
-                    [cfg.get('target_real_range', target_range)] if target_range else [],
-            })
-
-            forced_mask_for_joint = cfg.get('forced_cap_mask', None)
-            if torch.is_tensor(forced_mask_for_joint):
-                joint_mask = _build_joint_additive_mask_from_cap_mask(
-                    forced_mask_for_joint, int(img.shape[1]),
-                    target_text_range, img.device, dtype=torch.float32,
-                )
-                if torch.is_tensor(joint_mask):
-                    cfg['forced_joint_x_mask'] = joint_mask
-                    if mask is None:
-                        mask   = joint_mask
-                        result = (img, mask, img_size, cap_size, freqs_cis, timestep_zero_index)
-
-            transformer_options['untwisting_rope_zimage'] = cfg
-        except Exception:
-            pass
-
-        return result
-
-    dm.patchify_and_embed = types.MethodType(patched, dm)
-    _vprint(stats, f'{_PREFIX} patchify_and_embed patched.')
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Attention module patch
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _patch_joint_attention_modules(dm, stats):
-    matched = installed = restored = 0
-    patched_names: List[str] = []
-
-    for name, module in dm.named_modules():
-        if not _is_main_layers_attention_name(name, 0, 29):
-            continue
-        if not _is_joint_attention(module):
-            _vprint(stats, f'{_PREFIX} SKIP {name} ({type(module).__name__})')
-            continue
-
-        matched += 1
-        patched_names.append(name)
-
-        if hasattr(module, '_untwist_orig_forward'):
-            module.forward = module._untwist_orig_forward
-            restored += 1
-        else:
-            module._untwist_orig_forward = module.forward
-        original_forward = module._untwist_orig_forward
-
-        def make_forward(orig, module_name):
-            def patched_forward(self, x, x_mask, freqs_cis, transformer_options={}):
-                cfg = (
-                    transformer_options.get('untwisting_rope_zimage')
-                    if isinstance(transformer_options, dict) else None
-                )
-                if not cfg or not cfg.get('enabled'):
-                    return orig(x, x_mask, freqs_cis,
-                                transformer_options=transformer_options)
-
-                block_idx = int(transformer_options.get('block_index', -1))
-                if not (int(cfg['start_block']) <= block_idx <= int(cfg['end_block'])):
-                    return orig(x, x_mask, freqs_cis,
-                                transformer_options=transformer_options)
-
-                ref_ranges  = cfg.get('ref_real_ranges') or cfg.get('ref_k_ranges') or []
-                target_bsz  = int(cfg.get('cross_batch_target_batch', 0))
-                if not ref_ranges or target_bsz <= 0:
-                    return orig(x, x_mask, freqs_cis,
-                                transformer_options=transformer_options)
-
-                bsz, seqlen, _ = x.shape
-                if bsz < target_bsz * 2:
-                    return orig(x, x_mask, freqs_cis,
-                                transformer_options=transformer_options)
-
-                if x_mask is None and torch.is_tensor(cfg.get('forced_joint_x_mask', None)):
-                    try:
-                        fjm = cfg['forced_joint_x_mask'].to(device=x.device)
-                        if int(fjm.shape[0]) != bsz:
-                            fjm = _repeat_to_batch(fjm, bsz)
-                        if int(fjm.shape[-1]) != seqlen:
-                            cur = int(fjm.shape[-1])
-                            if cur > seqlen:
-                                fjm = fjm[..., :seqlen]
-                            else:
-                                pad = torch.zeros(
-                                    (*fjm.shape[:-1], seqlen - cur),
-                                    device=fjm.device, dtype=fjm.dtype,
-                                )
-                                fjm = torch.cat([fjm, pad], dim=-1)
-                        x_mask = fjm
-                    except Exception:
-                        x_mask = None
-
-                stats.attn_calls += 1
-
-                xq, xk, xv = torch.split(
-                    self.qkv(x),
-                    [self.n_local_heads    * self.head_dim,
-                     self.n_local_kv_heads * self.head_dim,
-                     self.n_local_kv_heads * self.head_dim],
-                    dim=-1,
-                )
-                xq = self.q_norm(xq.view(bsz, seqlen, self.n_local_heads,    self.head_dim))
-                xk = self.k_norm(xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim))
-                xv =             xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
-                progress   = float(cfg.get('progress', 0.0))
-                high_scale = _lerp(cfg['high_scale_start'], cfg['high_scale_end'], progress)
-                low_scale  = _lerp(cfg['low_scale_start'],  cfg['low_scale_end'],  progress)
-                beta       = float(cfg.get('beta', 2.0))
-
-                if cfg.get('apply_adain') and float(cfg.get('adain_strength', 0)) > 0:
-                    xq, xk = xq.clone(), xk.clone()
-                    xq, xk = _cross_batch_adain_qk(
-                        xq, xk, cfg, target_bsz, float(cfg['adain_strength'])
-                    )
-
-                xq, xk = apply_rope(xq, xk, freqs_cis)
-
-                scale_vec = _build_frequency_scale_vector(
-                    self.head_dim, cfg.get('axes_dims') or [],
-                    high_scale, low_scale, beta,
-                    xk.device, xk.dtype,
-                ).view(1, 1, 1, self.head_dim)
-
-                ref_k_pieces, ref_v_pieces = [], []
-                for s, e in ref_ranges:
-                    s, e = max(0, int(s)), min(int(e), seqlen)
-                    if e <= s:
-                        continue
-                    ref_k_pieces.append(xk[target_bsz:target_bsz*2, s:e] * scale_vec)
-                    ref_v_pieces.append(xv[target_bsz:target_bsz*2, s:e])
-
-                if not ref_k_pieces:
-                    return orig(x, x_mask, freqs_cis,
-                                transformer_options=transformer_options)
-
-                xq_t = xq[:target_bsz]
-                xk_t = torch.cat([xk[:target_bsz]] + ref_k_pieces, dim=1)
-                xv_t = torch.cat([xv[:target_bsz]] + ref_v_pieces, dim=1)
-                xk_t, xv_t = _repeat_kv_heads_if_needed(xk_t, xv_t, self.n_local_heads)
-
-                mask_t = None
-                if x_mask is not None:
-                    try:
-                        mask_t  = x_mask[:target_bsz]
-                        ref_len = sum(int(pc.shape[1]) for pc in ref_k_pieces)
-                        if mask_t.ndim >= 2:
-                            padding = torch.zeros(
-                                (*mask_t.shape[:-1], ref_len),
-                                device=mask_t.device, dtype=mask_t.dtype,
-                            )
-                            mask_t = torch.cat([mask_t, padding], dim=-1)
-                    except Exception:
-                        mask_t = None
-
-                out_t = optimized_attention_masked(
-                    xq_t.movedim(1,2), xk_t.movedim(1,2), xv_t.movedim(1,2),
-                    self.n_local_heads, mask_t,
-                    skip_reshape=True, transformer_options=transformer_options,
-                )
-
-                xq_r = xq[target_bsz:target_bsz*2]
-                xk_r, xv_r = _repeat_kv_heads_if_needed(
-                    xk[target_bsz:target_bsz*2],
-                    xv[target_bsz:target_bsz*2],
-                    self.n_local_heads,
-                )
-                mask_r = None
-                try:
-                    if x_mask is not None and int(x_mask.shape[0]) >= target_bsz * 2:
-                        mask_r = x_mask[target_bsz:target_bsz*2]
-                except Exception:
-                    pass
-                out_r = optimized_attention_masked(
-                    xq_r.movedim(1,2), xk_r.movedim(1,2), xv_r.movedim(1,2),
-                    self.n_local_heads, mask_r,
-                    skip_reshape=True, transformer_options=transformer_options,
-                )
-
-                outs = [out_t, out_r]
-                if bsz > target_bsz * 2:
-                    xq_e = xq[target_bsz*2:]
-                    xk_e, xv_e = _repeat_kv_heads_if_needed(
-                        xk[target_bsz*2:], xv[target_bsz*2:], self.n_local_heads
-                    )
-                    outs.append(optimized_attention_masked(
-                        xq_e.movedim(1,2), xk_e.movedim(1,2), xv_e.movedim(1,2),
-                        self.n_local_heads, None,
-                        skip_reshape=True, transformer_options=transformer_options,
-                    ))
-
-                return self.out(torch.cat(outs, dim=0))
-            return patched_forward
-
-        module.forward = types.MethodType(make_forward(original_forward, name), module)
-        setattr(module, '_untwist_v652_active', True)
-        installed += 1
-
-    _vprint(stats,
-        f'{_PREFIX} Attention patch: matched={matched} '
-        f'installed={installed} restored={restored}')
-    for n in patched_names:
-        _vprint(stats, f'{_PREFIX}   - {n}')
-
-    assert installed > 0, (
-        f'{_PREFIX} FATAL: No layers.0..29 attention modules patched.'
-    )
-    return matched, installed, restored
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ComfyUI Nodes — split RF inversion from Untwisting RoPE
+# Nodes Setup
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _rf_new_debug_store() -> Dict[str, Any]:
-    """Reset and return the module-level RF debug store used by RFInversion runtime."""
     debug_store: Dict[str, Any] = _RF_LAST_DEBUG_STORE
     debug_store.clear()
     debug_store.update({
@@ -1789,7 +985,6 @@ def _rf_new_debug_store() -> Dict[str, Any]:
     return debug_store
 
 def _rf_make_preview_callback(model_for_preview: Any, total_steps: int) -> Optional[Callable[[int, torch.Tensor, torch.Tensor, int], None]]:
-    """Create a ComfyUI-style latent preview callback for RF raw predictions."""
     total_steps = max(1, int(total_steps))
     if latent_preview is not None:
         try:
@@ -1812,7 +1007,6 @@ def _rf_emit_preview(
     x_current: Optional[torch.Tensor],
     total_steps: int,
 ) -> None:
-    """Emit one RF raw-pred preview frame without breaking sampling if preview decoding fails."""
     if callback is None or not torch.is_tensor(raw_pred):
         return
     try:
@@ -1823,7 +1017,6 @@ def _rf_emit_preview(
         print(f'{_PREFIX} ⚠ RF preview frame failed at step {int(step) + 1}: {exc}')
 
 def _rf_latent_get_config(rf_inversion: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any], Dict[str, Any], Optional[torch.Tensor], Optional[Any], str]:
-    """Read RFInversion's LATENT metadata without exposing a custom Comfy type."""
     if not isinstance(rf_inversion, dict):
         return False, {}, {}, None, None, 'not-connected'
     cfg = rf_inversion.get('untwist_rf_config', None)
@@ -1837,17 +1030,13 @@ def _rf_latent_get_config(rf_inversion: Optional[Dict[str, Any]]) -> Tuple[bool,
         rf_inversion['untwist_rf_state'] = state
     if not torch.is_tensor(ref_clean):
         return False, cfg, state, None, ref_conditioning, 'missing-ref-clean'
-    return True, cfg, state, ref_clean, ref_conditioning, 'RFInversion LATENT'
+    return True, cfg, state, ref_clean, ref_conditioning, 'RFInversionK9b LATENT'
 
-class RFInversion:
-    CATEGORY = 'model_patches/Untwisting RoPE'
+class RFInversionK9b:
+    CATEGORY = 'model_patches/Untwisting RoPE-Klein9b'
     RETURN_TYPES = ('MODEL', 'LATENT')
     RETURN_NAMES = ('model', 'rf_inversion')
     FUNCTION = 'build'
-    DESCRIPTION = (
-        'Stores RF inversion settings/reference data in a normal LATENT and captures '
-        'the sampler sigma schedule internally. No SIGMAS input is required.'
-    )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1857,13 +1046,8 @@ class RFInversion:
                 'reference_latent': ('LATENT',),
                 'rf_mode': (['linear', 'rf_gamma', 'rf_gamma_rk2', 'fireflow'], {
                     'default': 'rf_gamma',
-                    'tooltip': (
-                        'linear: no model velocity; pmi_alpha has no effect.\n'
-                        'rf_gamma/rf_gamma_rk2: use gamma and optional gamma_curve.\n'
-                        'fireflow: FireFlow recurrence with optional PMI/norm.'
-                    ),
                 }),
-                'gamma': ('FLOAT', {'default': 0.1, 'min': 0.0, 'max': 1.0, 'step': 0.01}),
+                'gamma': ('FLOAT', {'default': 0.2, 'min': 0.0, 'max': 1.0, 'step': 0.01}),
                 'gamma_curve': ('FLOAT', {'default': 2.0, 'min': 0.0, 'max': 8.0, 'step': 0.05}),
                 'norm_strength': ('FLOAT', {'default': 1.0, 'min': 0.0, 'max': 1.0, 'step': 0.05}),
                 'pmi_alpha': ('FLOAT', {'default': 0.5, 'min': 0.0, 'max': 1.0, 'step': 0.05}),
@@ -1891,12 +1075,11 @@ class RFInversion:
         verbose_flag = _coerce_bool(verbose)
 
         if not isinstance(reference_latent, dict) or 'samples' not in reference_latent:
-            raise RuntimeError("reference_latent must be a ComfyUI LATENT dict with 'samples'.")
+            raise RuntimeError("reference_latent must contain a 'samples' latent tensor.")
 
         ref_clean = reference_latent['samples'].detach().clone()
         ref_clean = model.model.process_latent_in(ref_clean)
 
-        # Directly ask ComfyUI what kind of model this is
         detected_param = 'unknown'
         try:
             m_type = str(getattr(model.model, 'model_type', ''))
@@ -1935,7 +1118,6 @@ class RFInversion:
         debug_store['cache'] = state['cache']
         debug_store['parameterization'] = detected_param
 
-        # Normal LATENT output: samples stay a latent tensor; extra keys carry RF metadata.
         rf_latent: Dict[str, Any] = dict(reference_latent)
         rf_latent['samples'] = reference_latent['samples']
         rf_latent['untwist_rf_config'] = cfg
@@ -1980,11 +1162,6 @@ class RFInversion:
                 debug_store['persistent_cache_key'] = None
                 debug_store['persistent_cache_hit'] = False
                 debug_store['parameterization'] = rf_latent.get('untwist_rf_parameterization', 'unknown')
-                if verbose_flag:
-                    print(
-                        f'{_PREFIX} RFInversion sampler_sample: captured {len(found)} sigmas  '
-                        f'run={state["run_count"]}  seed=42'
-                    )
             return executor(model_wrap, sigmas, extra_args, callback, noise, latent_image, denoise_mask, disable_pbar)
 
         model_clone.model_options = _clone_model_options(model_clone.model_options)
@@ -1995,31 +1172,13 @@ class RFInversion:
             is_model_options=True,
         )
 
-        if verbose_flag:
-            print(f'\n{_PREFIX} ═══════════════════════════════════════')
-            print(f'{_PREFIX} RF INVERSION PREPARED')
-            print(f'{_PREFIX} ═══════════════════════════════════════')
-            print(f'{_PREFIX}   mode          : {rf_mode}')
-            print(f'{_PREFIX}   gamma         : {float(gamma):.4f}')
-            print(f'{_PREFIX}   gamma_curve   : {float(gamma_curve):.3f}')
-            print(f'{_PREFIX}   norm_strength : {float(norm_strength):.3f}')
-            print(f'{_PREFIX}   pmi_alpha     : {float(pmi_alpha):.3f}')
-            print(f'{_PREFIX}   seed          : 42 (internal fixed noise seed)')
-            print(f'{_PREFIX}   schedule      : captured from sampler at runtime; no SIGMAS input')
-            print(f'{_PREFIX}   output        : normal LATENT with RF metadata')
-            print(f'{_PREFIX} ═══════════════════════════════════════\n')
-
         return (model_clone, rf_latent)
 
-class UntwistingRoPE:
+class UntwistingRoPEK9b:
     CATEGORY = 'model_patches/Untwisting RoPE'
     RETURN_TYPES = ('MODEL',)
     RETURN_NAMES = ('model',)
     FUNCTION = 'patch'
-    DESCRIPTION = (
-        'Patches Z-Image attention/RoPE and uses the RFInversion LATENT trajectory. '
-        'RF inversion settings live on the LATENT; the sampler sigma schedule is captured internally.'
-    )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2030,8 +1189,8 @@ class UntwistingRoPE:
                 'high_scale_start': ('FLOAT', {'default': 1.0, 'min': -4.0, 'max': 8.0, 'step': 0.01}),
                 'high_scale_end': ('FLOAT', {'default': 0.00, 'min': -4.0, 'max': 8.0, 'step': 0.01}),
                 'low_scale_start': ('FLOAT', {'default': 1.0, 'min': -4.0, 'max': 8.0, 'step': 0.01}),
-                'low_scale_end': ('FLOAT', {'default': 3.0, 'min': -4.0, 'max': 8.0, 'step': 0.01}),
-                'start_block': ('INT', {'default': 0, 'min': 0, 'max': 999, 'step': 1}),
+                'low_scale_end': ('FLOAT', {'default': 8.0, 'min': -4.0, 'max': 8.0, 'step': 0.01}),
+                'start_block': ('INT', {'default': 1, 'min': 0, 'max': 999, 'step': 1}),
                 'end_block': ('INT', {'default': 999, 'min': 0, 'max': 999, 'step': 1}),
                 'adain_strength': ('FLOAT', {'default': 0.5, 'min': 0.0, 'max': 1.0, 'step': 0.01}),
                 'verbose': ('BOOLEAN', {'default': False}),
@@ -2077,36 +1236,11 @@ class UntwistingRoPE:
             debug_store['built_sigmas'] = list(rf_state.get('schedule_sorted') or []) if isinstance(rf_state, dict) else []
             debug_store['parameterization'] = stats.parameterization
 
-        _vprint(stats, f'\n{_PREFIX} ═══════════════════════════════════════')
-        _vprint(stats, f'{_PREFIX} PATCH START  (split nodes: RFInversion + UntwistingRoPE)')
-        _vprint(stats, f'{_PREFIX} ═══════════════════════════════════════')
-        _vprint(stats, f'{_PREFIX} beta={beta}')
-        _vprint(stats, f'{_PREFIX} high_scale: {high_scale_start:.3f} → {high_scale_end:.3f}')
-        _vprint(stats, f'{_PREFIX} low_scale:  {low_scale_start:.3f} → {low_scale_end:.3f}')
-        _vprint(stats,
-            f'{_PREFIX} blocks [{start_block}, {end_block}]  '
-            f'adain={adain_strength:.2f}'
-        )
-        _vprint(stats, f'{_PREFIX} RF latent connected: {rf_active}  source={rf_source}')
-        if rf_active:
-            _vprint(stats,
-                f'{_PREFIX} RF trajectory: mode={rf_mode}  gamma={gamma}  '
-                f'gamma_curve={gamma_curve:.3f}  '
-                f'norm_strength={norm_strength}  pmi_alpha={pmi_alpha}  seed={seed}'
-            )
-            _vprint(stats, f'{_PREFIX} RF schedule: captured from sampler at runtime; no SIGMAS input')
-
         model_clone = model.clone()
         setattr(model_clone, '_untwisting_rope_rf_debug', debug_store)
         if rf_active:
             setattr(model_clone, '_untwisting_rope_rf_state', rf_state)
             setattr(model_clone, '_untwisting_rope_rf_config', rf_cfg)
-        dm = _safe_get_diffusion_model(model_clone)
-        _vprint(stats, f'{_PREFIX} Diffusion model type: {type(dm).__name__}')
-
-        _patch_context_refiner_mask_modules(dm, stats)
-        _patch_patchify_and_embed(dm, stats)
-        _patch_joint_attention_modules(dm, stats)
 
         old_wrapper = model_clone.model_options.get('model_function_wrapper', None)
 
@@ -2124,6 +1258,14 @@ class UntwistingRoPE:
             progress = _sigma_to_progress(timestep)
             target_b = int(input_x.shape[0])
 
+            axes_dims = [16, 56, 56]
+            try:
+                dm = _safe_get_diffusion_model(model_clone)
+                if hasattr(dm, "pe_embedder") and hasattr(dm.pe_embedder, "axes_dim"):
+                    axes_dims = list(dm.pe_embedder.axes_dim)
+            except Exception:
+                pass
+
             cfg: Dict[str, Any] = {
                 'enabled': True,
                 'beta': float(beta),
@@ -2137,6 +1279,7 @@ class UntwistingRoPE:
                 'adain_strength': float(adain_strength),
                 'cross_batch_target_batch': target_b if rf_active else 0,
                 'progress': progress,
+                'axes_dims': axes_dims,
             }
             to['untwisting_rope_zimage'] = cfg
 
@@ -2147,7 +1290,6 @@ class UntwistingRoPE:
             rf_cache_hit = False
             rf_cond_mode = 'not-connected'
             ref_mode = 'target-only'
-            should_print = _coerce_bool(getattr(stats, 'rf_verbose', False)) and (call_n <= 4 or call_n % 8 == 0)
 
             if rf_active and torch.is_tensor(ref_clean_cpu):
                 try:
@@ -2175,11 +1317,9 @@ class UntwistingRoPE:
                             built_cache = _cache_to_device(cached_entry['cache'], input_x.device, input_x.dtype)
                             eps = cached_entry['eps'].to(device=input_x.device, dtype=input_x.dtype)
                             sorted_sigmas = list(cached_entry['built_sigmas'])
-                            _rf_vprint(stats, f'{_PREFIX} RFInversion persistent cache HIT: key={cache_key[:12]}  cache={len(built_cache)}')
-                            ref_mode = 'RF sampler-sigma trajectory (persistent-cache hit)'
+                            ref_mode = 'RF persistent cache'
                             rf_state['persistent_cache_hit'] = True
                         else:
-                            _rf_vprint(stats, f'{_PREFIX} RFInversion persistent cache MISS: key={cache_key[:12]}  building trajectory')
                             preview_callback = rf_state.get('preview_callback', None)
                             if preview_callback is None:
                                 preview_callback = _rf_make_preview_callback(model_clone, max(1, len(sampler_sigmas) - 1))
@@ -2196,7 +1336,7 @@ class UntwistingRoPE:
                                     if torch.is_tensor(rf_state.get('eps', None)) else None,
                                 rf_mode=rf_mode,
                                 gamma_curve=gamma_curve,
-                                    norm_strength=norm_strength,
+                                norm_strength=norm_strength,
                                 pmi_alpha=pmi_alpha,
                                 preview_callback=preview_callback,
                             )
@@ -2205,7 +1345,7 @@ class UntwistingRoPE:
                                 'eps': eps.detach().to(device='cpu').clone(),
                                 'built_sigmas': list(sorted_sigmas),
                             })
-                            ref_mode = 'RF sampler-sigma trajectory (built)'
+                            ref_mode = 'RF build successful'
                             rf_state['persistent_cache_hit'] = False
 
                         rf_state['cache'] = built_cache
@@ -2231,16 +1371,9 @@ class UntwistingRoPE:
                         debug_store['persistent_cache_key'] = cache_key
                         debug_store['persistent_cache_hit'] = bool(rf_state.get('persistent_cache_hit', False))
                         debug_store['parameterization'] = stats.parameterization
-                        _rf_vprint(stats,
-                            f'{_PREFIX} RFInversion debug store updated: '
-                            f'cache={len(debug_store["cache"])}  '
-                            f'built_sigmas={len(debug_store["built_sigmas"] or [])}  '
-                            f'parameterization={stats.parameterization}'
-                        )
                     elif rf_state.get('schedule_built', False):
-                        ref_mode = 'RF sampler-sigma trajectory (cached)'
+                        ref_mode = 'RF cache reference'
                     else:
-                        # Fallback: no sampler wrapper triggered. This preserves original behavior.
                         rf_kwargs, rf_cond_mode = _build_rf_conditioning_kwargs(c, ref_conditioning, target_b)
                         rf_ref_clean = _repeat_to_batch(ref_clean, target_b)
                         preview_callback = rf_state.get('preview_callback', None)
@@ -2269,7 +1402,7 @@ class UntwistingRoPE:
                         rf_state['cache'] = cache
                         stats.rf_eps = rf_state['eps']
                         stats.rf_sigma_cache = rf_state['cache']
-                        ref_mode = 'RF direct fallback (no sampler wrapper)'
+                        ref_mode = 'RF step direct'
 
                     cache = rf_state.get('cache') if isinstance(rf_state.get('cache'), dict) else {}
                     cached = cache.get(sigma_key, None)
@@ -2286,23 +1419,10 @@ class UntwistingRoPE:
 
                     ref_noisy = _repeat_to_batch(cached.to(device=input_x.device, dtype=input_x.dtype), target_b)
 
-                    if should_print:
-                        print(
-                            f'{_PREFIX} [WRAPPER call={call_n}  σ={sigma:.4f}  progress={progress:.3f}  '
-                            f'parameterization={stats.parameterization}]\n'
-                            f'{_PREFIX}   input_x   mean={input_x.mean().item():.4f}  std={input_x.std().item():.4f}\n'
-                            f'{_PREFIX}   ref_noisy mean={ref_noisy.mean().item():.4f}  std={ref_noisy.std().item():.4f}  [{ref_mode}]\n'
-                            f'{_PREFIX}   |Δ|(input_x - ref_noisy) = {(input_x - ref_noisy).abs().mean().item():.4f}\n'
-                            f'{_PREFIX}   RF cache_hit={rf_cache_hit}  cond={rf_cond_mode}  '
-                            f'schedule_sigmas={len(rf_state.get("sampler_sigmas") or [])}'
-                        )
-
                     if ref_noisy.shape[-2:] == input_x.shape[-2:]:
                         input_for_model = torch.cat([input_x, ref_noisy], dim=0)
                         try:
-                            if (torch.is_tensor(timestep)
-                                    and timestep.ndim > 0
-                                    and int(timestep.shape[0]) == target_b):
+                            if torch.is_tensor(timestep) and timestep.ndim > 0 and int(timestep.shape[0]) == target_b:
                                 timestep_for_model = torch.cat([timestep, timestep], dim=0)
                             else:
                                 timestep_for_model = _repeat_to_batch(timestep, target_b * 2)
@@ -2319,17 +1439,11 @@ class UntwistingRoPE:
                         except Exception:
                             pass
                     else:
-                        print(
-                            f'{_PREFIX} ⚠ [call={call_n}] Spatial mismatch '
-                            f'input_x={tuple(input_x.shape[-2:])} '
-                            f'ref_noisy={tuple(ref_noisy.shape[-2:])} '
-                            f'→ target-only fallback'
-                        )
                         cfg['enabled'] = False
                         cfg['cross_batch_target_batch'] = 0
                         ref_noisy = None
                 except Exception as exc:
-                    print(f'{_PREFIX} ⚠ UntwistingRoPE RF latent fallback to target-only: {exc}')
+                    print(f'{_PREFIX} ⚠ RF guidance pipeline fallback: {exc}')
                     cfg['enabled'] = False
                     cfg['cross_batch_target_batch'] = 0
                     ref_noisy = None
@@ -2346,10 +1460,7 @@ class UntwistingRoPE:
             else:
                 raw_result = apply_model(input_for_model, timestep_for_model, **c)
 
-            if (rf_active
-                    and ref_noisy is not None
-                    and torch.is_tensor(raw_result)
-                    and raw_result.shape[0] >= target_b * 2):
+            if rf_active and ref_noisy is not None and torch.is_tensor(raw_result) and raw_result.shape[0] >= target_b * 2:
                 target_pred = raw_result[:target_b]
                 ref_pred = raw_result[target_b:target_b * 2]
 
@@ -2359,13 +1470,8 @@ class UntwistingRoPE:
                     debug_store['xhat_cache'][sigma_key] = (ref_xsigma - float(sigma) * ref_pred)[:1].detach().clone()
                     debug_store['xhat_plus_cache'][sigma_key] = (ref_xsigma + float(sigma) * ref_pred)[:1].detach().clone()
                 except Exception as exc:
-                    print(f'{_PREFIX} ⚠ Failed to cache RF debug latents at σ={float(sigma):.6f}: {exc}')
+                    print(f'{_PREFIX} ⚠ Failed to compute debug caches: {exc}')
 
-                if should_print:
-                    print(
-                        f'{_PREFIX}   target_pred mean={target_pred.mean().item():.4f}  std={target_pred.std().item():.4f}\n'
-                        f'{_PREFIX}   ref_pred    mean={ref_pred.mean().item():.4f}  std={ref_pred.std().item():.4f}  (discarded for sampler)'
-                    )
                 return target_pred
 
             return raw_result
@@ -2373,26 +1479,13 @@ class UntwistingRoPE:
         model_clone.model_options = _clone_model_options(model_clone.model_options)
         model_clone.set_model_unet_function_wrapper(model_function_wrapper)
 
-        _vprint(stats, f'\n{_PREFIX} ═══════════════════════════════════════')
-        _vprint(stats, f'{_PREFIX} PATCH COMPLETE')
-        if rf_active:
-            _vprint(stats, f'{_PREFIX}   RF input      : LATENT from RFInversion')
-            _vprint(stats, f'{_PREFIX}   RF schedule   : captured internally by RFInversion model wrapper')
-            _vprint(stats, f'{_PREFIX}   RF preview    : emitted while building inversion trajectory')
-            _vprint(stats, f'{_PREFIX}   K/V           : reference branch contributes K and V; only K is untwisted')
-        else:
-            _vprint(stats, f'{_PREFIX}   RF input      : not connected')
-            _vprint(stats, f'{_PREFIX}   Mode          : target-only attention patch')
-        _vprint(stats, f'{_PREFIX}   Output: target prediction returned unchanged')
-        _vprint(stats, f'{_PREFIX} ═══════════════════════════════════════\n')
-
         return (model_clone,)
 
 NODE_CLASS_MAPPINGS = {
-    'RFInversion': RFInversion,
-    'UntwistingRoPE': UntwistingRoPE,
+    'RFInversionK9b': RFInversionK9b,
+    'UntwistingRoPEK9b': UntwistingRoPEK9b,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    'RFInversion': 'RF Inversion',
-    'UntwistingRoPE': 'Untwisting RoPE',
+    'RFInversionK9b': 'RF Inversion (Klein 9b)',
+    'UntwistingRoPEK9b': 'Untwisting RoPE (Klein 9b)',
 }
